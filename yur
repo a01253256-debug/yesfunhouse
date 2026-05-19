@@ -1,0 +1,375 @@
+import socket
+import struct
+import threading
+import time
+import pygame
+import os
+
+gestures = [
+    "Thumb up",
+    "Extension of index and middle, flexion of the others",
+    "Flexion of ring and little finger, extension of the others",
+    "Thumb apposing base of little finger",
+    "Abduction of all fingers",
+    "Fingers flexed together in fist",
+    "Pointing index",
+    "Adduction of extended fingers",
+    "Wrist supination (axis: middle finger)",
+    "Wrist pronation (axis: middle finger)",
+    "Wrist supination (axis: little finger)",
+    "Wrist pronation (axis: little finger)",
+    "Wrist flexion",
+    "Wrist extension",
+    "Wrist radial deviation",
+    "Wrist ulnar deviation",
+    "Wrist extension with closed hand"
+]
+
+
+class TrignoClient:
+    def __init__(self, host, port_cmd, port_data):
+        self.host = host
+        self.port_cmd = port_cmd
+        self.port_data = port_data
+
+        self.sock_cmd = None
+        self.sock_data = None
+
+        self.emg_buffer = []
+
+        self._collecting = False
+        self._thread = None
+
+        self._lock = threading.Lock()
+
+        self.current_stimulus = 0
+        self.current_rep = 0
+
+        self.restimulus_buffer = []
+        self.rerepetition_buffer = []
+
+        self.current_phase = "rest"
+        self.current_gesture_name = ""
+        self.time_remaining = 0.0
+
+        self.protocol_finished = False
+
+    # ==========================================================
+    # CONNECT / DISCONNECT
+    # ==========================================================
+
+    def connect(self):
+        self.sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock_cmd.connect((self.host, self.port_cmd))
+
+        self.sock_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock_data.connect((self.host, self.port_data))
+
+        print("Connected.")
+
+    def disconnect(self):
+        if self.sock_cmd:
+            self.sock_cmd.close()
+
+        if self.sock_data:
+            self.sock_data.close()
+
+        print("Disconnected.")
+
+    # ==========================================================
+    # DATA STREAM
+    # ==========================================================
+
+    def _recv_exact(self, nbytes):
+        data = b''
+
+        while len(data) < nbytes:
+            packet = self.sock_data.recv(nbytes - len(data))
+
+            if not packet:
+                raise ConnectionError("Socket disconnected")
+
+            data += packet
+
+        return data
+
+    def _read_loop(self):
+        while self._collecting:
+
+            raw = self._recv_exact(64)
+            values = struct.unpack('16f', raw)
+
+            with self._lock:
+                self.emg_buffer.append(values[:8])
+                self.restimulus_buffer.append(self.current_stimulus)
+                self.rerepetition_buffer.append(self.current_rep)
+
+    def _start_stream(self):
+        self._collecting = True
+
+        self._thread = threading.Thread(
+            target=self._read_loop,
+            daemon=True
+        )
+
+        self._thread.start()
+
+    def _stop_stream(self):
+        self._collecting = False
+
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    # ==========================================================
+    # COUNTDOWN HELPER
+    # ==========================================================
+
+    def _countdown(self, seconds):
+        self.time_remaining = float(seconds)
+
+        while self.time_remaining > 0:
+            time.sleep(0.1)
+            self.time_remaining -= 0.1
+
+        self.time_remaining = 0.0
+
+    # ==========================================================
+    # MAIN PROTOCOL
+    # ==========================================================
+
+    def start_collection(self):
+
+        print("Starting session. Get ready...")
+
+        self.current_phase = "rest"
+        self.current_gesture_name = "Get Ready"
+
+        self._countdown(3)
+
+        self._start_stream()
+
+        for g_idx, g in enumerate(gestures):
+
+            print(f"\n--- Gesture: {g} ---")
+
+            for r in range(6):
+
+                # =========================
+                # REST PHASE
+                # =========================
+
+                self.current_phase = "rest"
+
+                self.current_stimulus = 0
+                self.current_rep = 0
+
+                self.current_gesture_name = g
+
+                self._countdown(3)
+
+                # =========================
+                # CONTRACTION PHASE
+                # =========================
+
+                self.current_phase = "contraction"
+
+                self.current_stimulus = g_idx + 1
+                self.current_rep = r + 1
+
+                self.current_gesture_name = g
+
+                self._countdown(5)
+
+            self.current_stimulus = 0
+
+        self._stop_stream()
+
+        self.protocol_finished = True
+
+        print("Protocol finished.")
+
+
+# ==============================================================
+# DRAW FUNCTION
+# ==============================================================
+
+def draw_frame(screen, font, small_font, client, image_cache):
+
+    WIDTH, HEIGHT = screen.get_size()
+
+    # ==========================================================
+    # REST SCREEN
+    # ==========================================================
+
+    if client.current_phase == "rest":
+
+        screen.fill((0, 0, 0))
+
+        rest_text = font.render("REST", True, (255, 255, 255))
+
+        rest_rect = rest_text.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 50))
+
+        screen.blit(rest_text, rest_rect)
+
+        countdown = str(int(client.time_remaining) + 1)
+
+        countdown_text = font.render(countdown, True, (255, 255, 255))
+
+        countdown_rect = countdown_text.get_rect(
+            center=(WIDTH // 2, HEIGHT // 2 + 50)
+        )
+
+        screen.blit(countdown_text, countdown_rect)
+
+    # ==========================================================
+    # CONTRACTION SCREEN
+    # ==========================================================
+
+    elif client.current_phase == "contraction":
+
+        screen.fill((30, 30, 30))
+
+        g_idx = client.current_stimulus
+
+        if g_idx > 0:
+
+            img_path = f"gestures/{g_idx}.png"
+
+            if img_path not in image_cache:
+
+                img = pygame.image.load(img_path)
+
+                img = pygame.transform.scale(img, (400, 400))
+
+                image_cache[img_path] = img
+
+            img = image_cache[img_path]
+
+            img_rect = img.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 50))
+
+            screen.blit(img, img_rect)
+
+        # Gesture name
+        gesture_text = small_font.render(
+            client.current_gesture_name,
+            True,
+            (255, 255, 255)
+        )
+
+        gesture_rect = gesture_text.get_rect(
+            center=(WIDTH // 2, HEIGHT - 120)
+        )
+
+        screen.blit(gesture_text, gesture_rect)
+
+        # Countdown
+        countdown = str(int(client.time_remaining) + 1)
+
+        countdown_text = font.render(countdown, True, (255, 100, 100))
+
+        countdown_rect = countdown_text.get_rect(
+            center=(WIDTH // 2, HEIGHT - 60)
+        )
+
+        screen.blit(countdown_text, countdown_rect)
+
+        # Progress
+        progress = (
+            f"Rep {client.current_rep}/6  —  "
+            f"Gesture {client.current_stimulus}/17"
+        )
+
+        progress_text = small_font.render(
+            progress,
+            True,
+            (200, 200, 200)
+        )
+
+        progress_rect = progress_text.get_rect(
+            center=(WIDTH // 2, 40)
+        )
+
+        screen.blit(progress_text, progress_rect)
+
+    pygame.display.flip()
+
+
+# ==============================================================
+# MAIN
+# ==============================================================
+
+def main():
+
+    pygame.init()
+
+    WIDTH = 1000
+    HEIGHT = 700
+
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+
+    pygame.display.set_caption("Delsys Gesture Acquisition")
+
+    font = pygame.font.SysFont("Arial", 72)
+    small_font = pygame.font.SysFont("Arial", 32)
+
+    clock = pygame.time.Clock()
+
+    image_cache = {}
+
+    # ==========================================================
+    # CREATE CLIENT
+    # ==========================================================
+
+    client = TrignoClient(
+        host="127.0.0.1",
+        port_cmd=50040,
+        port_data=50043
+    )
+
+    client.connect()
+
+    # ==========================================================
+    # START PROTOCOL THREAD
+    # ==========================================================
+
+    protocol_thread = threading.Thread(
+        target=client.start_collection,
+        daemon=True
+    )
+
+    protocol_thread.start()
+
+    # ==========================================================
+    # MAIN GUI LOOP
+    # ==========================================================
+
+    running = True
+
+    while running:
+
+        for event in pygame.event.get():
+
+            if event.type == pygame.QUIT:
+                running = False
+
+        draw_frame(
+            screen,
+            font,
+            small_font,
+            client,
+            image_cache
+        )
+
+        if client.protocol_finished:
+            running = False
+
+        clock.tick(30)
+
+    client.disconnect()
+
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
